@@ -1,0 +1,63 @@
+# Render blueprint. Push this repo to GitHub, then:
+#   Render dashboard -> New -> Blueprint -> pick the repo.
+#
+# Everything below is free-tier compatible. Read the two warnings.
+services:
+  - type: web
+    name: study-planner-api
+    runtime: python
+    plan: free
+    rootDir: .              # set to "backend" if the repo root is the monorepo
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.7"
+
+      - key: SECRET_KEY
+        generateValue: true          # Render generates a strong random value
+
+      - key: ENV
+        value: production
+
+      # ---------------------------------------------------------------
+      # WARNING 1 — storage.
+      # The free plan has an ephemeral filesystem: this SQLite file is wiped
+      # on every deploy and every cold start. Fine for a hackathon demo (just
+      # re-run the seed), NOT fine if judges create accounts you need to keep.
+      #
+      # To persist: create a free Render Postgres instance and replace this with
+      #   DATABASE_URL = postgresql+psycopg://<from Render's Internal URL>
+      # `psycopg[binary]` is already in requirements.txt, so nothing else changes.
+      # ---------------------------------------------------------------
+      - key: DATABASE_URL
+        value: sqlite:///./studyplanner.db
+
+      # ---------------------------------------------------------------
+      # Set this to your Vercel URL AFTER the first frontend deploy, e.g.
+      #   https://study-planner-agent.vercel.app
+      # Comma-separated for several. CORS_ORIGIN_REGEX below already covers
+      # Vercel preview deployments, whose subdomain changes on every push.
+      # ---------------------------------------------------------------
+      - key: CORS_ORIGINS
+        sync: false
+
+      - key: CORS_ORIGIN_REGEX
+        value: "https://.*\\.vercel\\.app"
+
+      # Optional — leave unset and the app runs its deterministic fallbacks.
+      - key: GEMINI_API_KEY
+        sync: false
+
+      - key: GEMINI_MODEL
+        value: gemini-2.0-flash
+
+# ---------------------------------------------------------------------
+# WARNING 2 — cold starts.
+# Free Render services sleep after ~15 minutes idle and take 30–60s to wake.
+# That is a demo killer. Before you present, either open the API's /api/health
+# once to wake it, or set up a free uptime pinger (cron-job.org) hitting
+# /api/health every 10 minutes.
+# ---------------------------------------------------------------------
