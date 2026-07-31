@@ -1,48 +1,26 @@
-# Study Planner Agent — Backend
+# Chipper — an AI study planner that tells you the truth
 
-An agent that ingests a timetable, assignments and goal preferences, produces a
-realistic weekly plan with reminders and progress tracking, and **rebuilds the
-plan when deadlines or progress change** — showing exactly what changed and why.
+**Team Slytherin**
 
-FastAPI · SQLAlchemy · SQLite (Postgres-swappable) · JWT · Google Gemini.
+Students receive syllabi, deadlines, attendance rules and exam dates across a
+dozen places. Chipper ingests all of it and produces a weekly plan that fits
+their *actual* free time — and rebuilds that plan when deadlines or progress
+change.
 
----
+The part that makes it different: **when the week does not fit, Chipper says so.**
+Most planners quietly drop work or spread it thinner. Chipper computes whether a
+feasible schedule exists at all, and when one doesn't, it says which items to
+shed and what each will cost you.
 
-## Quick start
+| | |
+|---|---|
+| **Live app** | https://team-slytherin-abhishek-kumar-singh-i7hismg1c-slytherin3.vercel.app/login |
+| **Live API** | https://team-slytherin-abhishek-kumar-singh-2.onrender.com/api/health |
+| **API docs** | https://team-slytherin-abhishek-kumar-singh-2.onrender.com/docs |
+| **Demo login** | `demo@student.edu` / `demo1234` |
 
-```bash
-cd backend
-python -m venv .venv
-.venv\Scripts\activate          # Windows
-# source .venv/bin/activate     # macOS / Linux
-
-pip install -r requirements.txt
-copy .env.example .env          # cp on macOS/Linux
-python seed.py                  # demo@student.edu / demo1234
-uvicorn app.main:app --reload
-```
-
-Interactive docs: <http://127.0.0.1:8000/docs>
-
-**Verify it actually works** (no server, no key needed — do this first):
-
-```bash
-python tests/test_scheduler.py        # 19 engine tests   — stdlib only
-python tests/test_syllabus_parser.py  # 14 parser tests   — needs dateutil only
-python verify.py                      # ~65 assertions, full journey in-process
-pytest -q                             # all of the above, if you prefer pytest
-```
-
-`verify.py` spins the app up against a throwaway SQLite file and walks
-register → courses → timetable → syllabus ingest → plan → inspect rationale →
-accept/reject → log progress → replan → read the diff, asserting on the
-*content* of each response. It also re-checks the hard constraints on the
-generated plan (no overlaps, nothing during a class, daily cap respected,
-nothing past a deadline). If it passes, the backend is demo-ready.
-
-Gemini is optional. With `GEMINI_API_KEY` unset the app runs the deterministic
-scheduler and the rule-based syllabus parser, and every endpoint still returns
-useful output. Get a free key at <https://aistudio.google.com/apikey>.
+> The API is on a free tier and sleeps after 15 minutes idle. The first request
+> after a nap takes 30–60 seconds. Open `/api/health` once before demoing.
 
 ---
 
@@ -50,20 +28,19 @@ useful output. Get a free key at <https://aistudio.google.com/apikey>.
 
 **The LLM never decides when you study.**
 
-| Layer | Responsibility | Implementation |
+| Layer | Responsibility | How |
 |---|---|---|
-| `app/ai/scheduler.py` | *When* — placement, constraints, feasibility | Deterministic. No network. Unit-tested. |
-| `app/ai/syllabus_parser.py` | *What exists* — parsing messy documents | Gemini + regex, cross-checked |
-| `app/ai/planner_agent.py` | Orchestration + narration | Gemini, read-only over the plan |
+| `backend/app/ai/scheduler.py` | *When* — placement, constraints, feasibility | Deterministic. No network. 19 unit tests. |
+| `backend/app/ai/syllabus_parser.py` | *What exists* — reading messy documents | Gemini + regex, cross-checked against each other |
+| `backend/app/ai/planner_agent.py` | Orchestration and narration | Gemini, read-only over a finished plan |
 
-Consequences, all of which the judging criteria reward:
+Consequences:
 
-- Hard constraints (class times, daily caps, deadlines) **cannot** be
-  hallucinated away.
+- Class times, daily caps and deadlines **cannot** be hallucinated away.
 - The plan is reproducible — same inputs, same output, every time.
-- `GET /api/blocks/{id}/explain` returns the *actual arithmetic* used, not a
-  post-hoc story generated after the fact.
-- Pull the API key and the product still works.
+- `GET /api/blocks/{id}/explain` returns the *actual arithmetic* the engine used,
+  not a story written afterwards.
+- Pull the API key and the product still works. It degrades; it doesn't break.
 
 ---
 
@@ -71,19 +48,19 @@ Consequences, all of which the judging criteria reward:
 
 ### Placement
 
-Chronological greedy dispatch over free time. At every cursor position `t`:
+Chronological greedy dispatch over free time. At each cursor position `t`:
 
 ```
 a* = argmax_{a ∈ Eligible(t)}  Σ_k  w_k · f_k(a, t)
 ```
 
-`Eligible(t)` enforces the hard constraints; the six factors `f_k` are
-normalised to `[0,1]`; the weights `w_k` are the user's, editable at
-`PATCH /api/auth/preferences`, and returned with every plan.
+`Eligible(t)` enforces the hard constraints. The six factors `f_k` are
+normalised to `[0,1]`; the weights `w_k` are the user's, editable in Settings and
+returned with every plan.
 
-| Factor | What it measures |
+| Factor | Measures |
 |---|---|
-| `deadline_pressure` | Feasibility ratio (below) blended 65/35 with time decay |
+| `deadline_pressure` | Feasibility ratio (below), blended 65/35 with time decay |
 | `grade_impact` | `min(1, grade_weight / 25)` — saturating |
 | `user_priority` | Per-course importance multiplier |
 | `energy_match` | Task difficulty vs. the energy level of that time slot |
@@ -91,38 +68,40 @@ normalised to `[0,1]`; the weights `w_k` are the user's, editable at
 | `spacing` | Distributed practice for exams, momentum for project work |
 
 Set `weight_deadline_pressure = 1` and the rest to `0` and the rule reduces to
-EDF. There is a test for that (`test_earlier_deadline_wins_when_only_pressure_matters`).
+earliest-deadline-first. There's a test that asserts exactly that.
 
-### Feasibility — the part most planners get wrong
+### Feasibility — the interesting part
 
-The useful quantity is not "days until the deadline", it's **slack**, and the
-correct slack is the cohort version from the classic single-machine feasibility
-theorem (Jackson's rule / EDF). A set of tasks with deadlines is schedulable
-iff, for every deadline `d`:
+The useful quantity is not "days until the deadline", it's **slack** — and the
+correct slack is the cohort version from the single-machine feasibility theorem
+(Jackson's rule). A set of tasks with deadlines is schedulable iff, for every
+deadline `d`:
 
 ```
-Σ_{b : d_b ≤ d} remaining_b   ≤   free_capacity(t, d)
+Σ_{b : d_b ≤ d} remaining_b   ≤   usable_capacity(t, d)
 ```
 
 We compute that ratio directly and call it `cohort_pressure`:
 
-- `< 1` — everything due by `d` still fits
-- `= 1` — zero slack; any slippage causes a miss
-- `> 1` — **provably infeasible.** No schedule exists.
+- **< 1** — everything due by `d` still fits
+- **= 1** — zero slack; any slippage causes a miss
+- **> 1** — **provably infeasible.** No schedule exists.
 
-When it exceeds 1 the agent says so in the first sentence of the strategy note
-and offers triage instead of quietly dropping work. Triage is a fractional-knapsack
-argument: to maximise retained grade under an hours budget, shed in increasing
-order of grade-per-hour. The API returns the shed list; **the user decides**.
+`usable_capacity` is *not* wall-clock free time. A week with 87 hours of gaps
+between classes yields about 30 hours of study once a 5h/day ceiling and a 15%
+slack reserve are applied. Dividing by the wrong number is how a planner ends up
+claiming a week fits when it demonstrably doesn't.
+
+When the ratio exceeds 1, Chipper says so in the first sentence of the strategy
+note and offers triage — a fractional-knapsack argument: to maximise retained
+grade under an hours budget, shed in increasing order of grade-per-hour. It
+shows the shed list. **The user decides.**
 
 ### Hard constraints enforced
 
 Day window · per-day hour ceiling · min/max block length · breaks · transition
 pad after classes · protected days · per-assignment and per-exam daily caps ·
-task dependencies · interleaving guard (max consecutive blocks per course,
-overridden only when a course is provably behind) · deadline buffer (finish
-early by default) · slack reserve (a % of each day left unallocated so one bad
-day doesn't cascade).
+task dependencies · interleaving guard · deadline buffer · slack reserve.
 
 ### Learning from rejections
 
@@ -132,184 +111,153 @@ A rejected suggestion updates a bounded exponential-decay bias:
 bias_k ← clip( bias_k·(1−η) + η·δ ,  −0.25, +0.15 )      η = 0.35
 ```
 
-keyed on time-of-day, course or task type depending on the `reason_code`. The
-bias is added straight to the priority score (whose factors sum to ≈1), so a
-sustained pattern of rejections reshapes the plan while a genuinely urgent task
-can still override a learned dislike. That asymmetry is deliberate.
-Reset with `POST /api/auth/preferences/reset-learning`.
-
-### Estimation calibration
-
-Students underestimate effort. Once three assignments are finished the API
-reports `estimation_bias = logged_hours / estimated_hours`, and any assignment
-that overruns has its estimate grown rather than silently blowing the plan.
+keyed on time-of-day, course or task type depending on the reason code. It's
+added straight to the priority score, whose factors sum to ≈1 — so a sustained
+pattern of rejections reshapes the plan, while a genuinely urgent task can still
+override a learned dislike. That asymmetry is deliberate.
 
 ---
 
-## Ingestion, and not trusting the model
+## Not trusting the model
 
-`POST /api/ingest/text` and `/api/ingest/file` (PDF or text) both run **two**
-extractors: Gemini and a regex/dateutil parser. Then:
+`POST /api/ingest/text` and `/api/ingest/file` run **two** extractors — Gemini and
+a regex/dateutil parser — then:
 
-1. Every item must carry `evidence` — the literal source substring. If the
-   evidence doesn't occur in the document, confidence is capped at 0.55.
+1. Every item must carry `evidence`: the literal source substring. If that text
+   doesn't occur in the document, confidence is capped at 0.55.
 2. Every LLM deadline is checked against dates found verbatim in the source.
    Uncorroborated dates get `needs_review: true` and a warning.
 3. Items the rule parser found but the model missed are merged back in.
 
-A hallucinated due date is the single most damaging failure mode for this
-product, so it is defended against explicitly. Use `/api/ingest/preview` for a
-dry run so the UI can put a confirmation step between the model and the user's
-real schedule.
+A hallucinated due date is the single most damaging failure mode for a planner,
+so it's defended against explicitly rather than hoped away.
 
 ---
 
-## API contract (for the frontend)
+## The two screens to look at
 
-Base URL `http://127.0.0.1:8000/api`. All routes except `/health`, `/auth/register`
-and `/auth/login` need `Authorization: Bearer <token>`.
+**Planner → Why?** — opens `/api/blocks/{id}/explain` and renders the six
+factors, each value × weight = contribution, plus a live check that the
+contributions reconstruct the reported score. That check is the point: it is
+what separates an explanation from a plausible story.
 
-### Auth & preferences
-| Method | Path | Notes |
-|---|---|---|
-| POST | `/auth/register` | → `{access_token, user}` |
-| POST | `/auth/login` | → `{access_token, user}` |
-| GET | `/auth/me` | |
-| GET | `/auth/preferences` | all scheduler knobs |
-| PATCH | `/auth/preferences` | partial; changing a weight changes the next plan |
-| POST | `/auth/preferences/reset-learning` | clear learned biases |
-
-### Courses & timetable
-| Method | Path | Notes |
-|---|---|---|
-| GET/POST | `/courses` | includes `attendance_pct`, `attendance_at_risk` |
-| PATCH/DELETE | `/courses/{id}` | |
-| GET | `/courses/{id}/attendance?remaining_classes=` | exact "classes you can still miss" |
-| GET/POST | `/timetable` | |
-| POST | `/timetable/bulk` | `{slots:[...], replace_existing:bool}` — import a week |
-| PATCH/DELETE | `/timetable/{id}` | |
-| GET | `/timetable/week?start=&days=` | recurrence already expanded onto real dates |
-| GET | `/timetable/free-slots?days=` | **exactly what the scheduler sees** — best debug endpoint |
-| GET/POST | `/calendar-exceptions` | one-off busy/free overrides (wedding, cancelled class) |
-
-### Assignments
-| Method | Path | Notes |
-|---|---|---|
-| GET | `/assignments?status=&course_id=&due_within_days=&include_done=` | |
-| POST | `/assignments` | omit `estimated_hours` and the agent estimates it |
-| POST | `/assignments/bulk` | |
-| GET/PATCH/DELETE | `/assignments/{id}` | |
-| POST | `/assignments/{id}/complete` | |
-| POST | `/assignments/{id}/reestimate` | needs a Gemini key |
-
-### Planning
-| Method | Path | Notes |
-|---|---|---|
-| POST | `/plan/generate` | `{horizon_days, preserve_accepted, use_llm_narrative, focus_note}` |
-| POST | `/plan/replan?reason=` | detects missed blocks first, keeps accepted ones |
-| GET | `/plan/needs-replan` | cheap poll → `{needs_replan, reasons[], trigger}` |
-| GET | `/plan/current` | `null` if none |
-| GET | `/plan/history` · `/plan/{id}` | |
-| GET | `/plan/{id}/diagnostics` | capacity, risks, triage, weights, constraints |
-| GET | `/plan/{id}/revision` | the diff vs. the previous version |
-| GET | `/plan/revisions/all` | |
-| POST | `/plan/ask` | `{question}` grounded strictly in the user's own data |
-
-### Blocks — accept / edit / reject
-| Method | Path | Notes |
-|---|---|---|
-| GET | `/blocks?start=&days=&status=` · `/blocks/today` | |
-| POST | `/blocks/{id}/decision` | `{action, reason_code, comment, new_start, new_end, lock}` |
-| POST | `/blocks/bulk-decision` · `/blocks/accept-all` | |
-| PATCH/DELETE | `/blocks/{id}` | drag-and-drop lands here |
-| GET | `/blocks/{id}/explain?use_llm=` | factor table + narration |
-
-`action` ∈ `accept · reject · edit · reschedule · complete · skip`.
-`reason_code` ∈ `too_early · too_late · too_long · wrong_subject · clashes_with_life ·
-too_hard_then · already_done` — this is what drives the learning loop, so send it.
-
-### Progress, reminders, dashboard
-| Method | Path | Notes |
-|---|---|---|
-| POST/GET | `/progress` | `{block_id or assignment_id, minutes_spent, completion_delta, focus_rating}` |
-| GET | `/progress/summary` | adherence, streak, goal progress, estimation bias, at-risk |
-| GET | `/progress/timeseries?days=` | planned vs actual per day — chart-ready |
-| GET | `/reminders?within_hours=` | block starts, deadline T-24h/T-2h, risk alerts |
-| POST | `/reminders/{id}/dismiss` | |
-| GET | `/insights/dashboard` | **one call renders the whole Dashboard page** |
-
-### Ingestion
-| Method | Path | Notes |
-|---|---|---|
-| POST | `/ingest/text` | `{text, course_id, course_hint, auto_create}` |
-| POST | `/ingest/file` | multipart PDF/txt |
-| POST | `/ingest/preview` | extract without saving |
-
-### Suggested frontend wiring
-
-- **Dashboard** → `GET /insights/dashboard` (single call)
-- **Timetable** → `GET /timetable/week`, `POST /timetable/bulk`
-- **Assignments** → `GET/POST /assignments`, `POST /ingest/file`
-- **Planner** → `POST /plan/generate`, `GET /blocks`, `POST /blocks/{id}/decision`,
-  `GET /blocks/{id}/explain` in a "why?" popover
-- **Progress** → `GET /progress/summary` + `/progress/timeseries`
-- **Settings** → `GET/PATCH /auth/preferences` — surface the six objective
-  weights as sliders and regenerate live; it demos extremely well
+**Settings → objective weights** — push *deadline pressure* to 1.00, everything
+else to 0.00, hit **Rebuild plan**, and the schedule collapses to
+earliest-deadline-first. Thirty seconds, and nobody can call the knobs
+decorative.
 
 ---
 
-## Demo script (3 minutes, hits every judging criterion)
+## Architecture
 
-1. `python seed.py` — deliberately overcommitted week, one course already below
-   its attendance threshold.
-2. Paste a syllabus into `/ingest/text` → items appear with `evidence` and
-   `needs_review` flags. *Transparency of inputs.*
-3. `POST /plan/generate` → strategy note leads with the binding constraint.
-   Open `/plan/{id}/diagnostics`: demand vs capacity, per-assignment
-   `cohort_pressure`, triage list. *Planning quality.*
-4. Click any block → `/blocks/{id}/explain`: six factors, weights,
-   contributions summing to the score, constraints enforced, alternatives
-   rejected. *Transparency of reasoning.*
-5. Reject two evening blocks with `reason_code: clashes_with_life`, regenerate
-   → evening blocks disappear. *Genuinely useful, not decorative.*
-6. Add a surprise quiz due tomorrow → `POST /plan/replan` → `/plan/{id}/revision`
-   shows exactly what moved and why; already-accepted blocks stayed put.
-   *Updates when deadlines change.*
+```
+Browser (React + Vite)  ──HTTPS──▶  FastAPI  ──▶  PostgreSQL / SQLite
+      Vercel                        Render
+```
 
----
-
-## Layout
+The browser never touches the database. Only the backend holds credentials.
+Two environment variables wire the whole system: `VITE_API_URL` (frontend →
+backend) and `DATABASE_URL` (backend → database).
 
 ```
 backend/
 ├── app/
-│   ├── main.py                  FastAPI app, CORS, health
-│   ├── config.py                settings
-│   ├── api/                     auth · timetable · assignment · planner · progress · ingest
-│   ├── models/                  SQLAlchemy ORM + enums
-│   ├── schemas/                 Pydantic request/response
-│   ├── database/db.py           engine, session, init_db
-│   ├── core/                    security (JWT/bcrypt), time/interval algebra
-│   ├── ai/
-│   │   ├── scheduler.py         ← the engine
-│   │   ├── planner_agent.py     orchestration, diffs, reminders
-│   │   ├── syllabus_parser.py   LLM + rule extraction, provenance checks
-│   │   ├── llm_client.py        Gemini wrapper that never raises
-│   │   └── prompt.py            all prompts, one file
-│   └── services/                feedback learning, progress accounting
-├── tests/test_scheduler.py      engine unit tests
-├── verify.py                    full-journey self-check
-├── seed.py                      demo data
-└── requirements.txt
+│   ├── ai/scheduler.py          ← the engine (deterministic)
+│   ├── ai/planner_agent.py      orchestration, diffs, reminders
+│   ├── ai/syllabus_parser.py    LLM + rule extraction, provenance checks
+│   ├── ai/llm_client.py         Gemini wrapper that never raises
+│   ├── api/                     auth · timetable · assignments · planner · progress · ingest
+│   ├── models/                  SQLAlchemy ORM, JSONB on Postgres
+│   └── services/                feedback learning, progress accounting, queries
+├── tests/                       33 offline tests, no network needed
+├── verify.py                    ~70-assertion end-to-end suite
+└── seed.py                      deliberately overcommitted demo week
+
+frontend/
+└── src/
+    ├── pages/                   Dashboard · Planner · Assignments · Timetable · Progress · Settings · Ask
+    ├── components/WhyPanel.jsx  the transparency surface
+    └── services/api.js          typed client for every endpoint
 ```
 
-## Notes
+---
 
-- SQLite by default; set `DATABASE_URL=postgresql+psycopg://…` for Postgres.
-  Tables are created at startup — for a hackathon that's the right call; add
-  Alembic before anyone real uses this.
-- All datetimes are naive local time. The scheduler normalises at the boundary;
-  mixing aware and naive datetimes is the classic source of off-by-one-day bugs.
-- Reminders are materialised rows the frontend polls. There's no push
-  infrastructure — `fire_at` is there so a worker or a service worker can send
-  them later.
+## Running locally
+
+**Backend** (Python 3.12):
+
+```bash
+cd backend
+python -m venv venv
+venv\Scripts\activate          # macOS/Linux: source venv/bin/activate
+pip install -r requirements.txt
+copy .env.example .env         # macOS/Linux: cp
+python seed.py
+uvicorn app.main:app --reload
+```
+
+**Frontend** (Node 18+), in a second terminal:
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+Open <http://localhost:5173>. No `.env` needed — Vite proxies `/api` to
+`127.0.0.1:8000`, so the browser stays same-origin and CORS never applies.
+
+A Gemini key is optional. Without it the deterministic engine and the rule-based
+parser handle everything; you lose LLM-written strategy notes, nothing else.
+
+### Tests
+
+```bash
+python tests/test_scheduler.py        # 19 engine tests — stdlib only
+python tests/test_syllabus_parser.py  # 14 parser tests
+python verify.py                      # full journey, in-process
+```
+
+`verify.py` walks register → ingest → plan → accept/reject → progress → replan
+and re-checks the hard constraints on the generated plan: no overlaps, nothing
+during a class, daily cap respected, nothing past a deadline.
+
+---
+
+## Deployment
+
+| Service | Platform | Config |
+|---|---|---|
+| API | Render | Docker runtime, `./Dockerfile`, Root Directory blank |
+| Frontend | Vercel | Root Directory `frontend`, `VITE_API_URL` set to the Render URL |
+
+Environment variables on Render:
+
+```
+DATABASE_URL        Postgres URL, or omit for ephemeral SQLite
+SECRET_KEY          40+ random characters
+AUTO_CREATE_TABLES  true
+SEED_ON_STARTUP     true    (free tier has no shell; seeds only if users table is empty)
+CORS_ORIGINS        your Vercel URL
+GEMINI_API_KEY      optional
+```
+
+Three things that look like bugs and aren't:
+
+- **Cold starts.** Free Render sleeps after 15 minutes idle; first request takes
+  30–60s.
+- **`VITE_API_URL` is baked in at build time.** Changing it in Vercel does
+  nothing until you redeploy.
+- **Free Render disk is ephemeral.** SQLite is wiped on redeploy;
+  `SEED_ON_STARTUP` re-seeds automatically.
+
+---
+
+## Tech
+
+FastAPI · SQLAlchemy 2.0 · PostgreSQL · Pydantic v2 · JWT · Google Gemini ·
+React 18 · Vite · Tailwind · Recharts · Docker
+
+## Team
+
+Team Slytherin — see `TEAM.md` for the work split.
